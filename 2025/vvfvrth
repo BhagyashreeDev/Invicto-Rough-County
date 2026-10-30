@@ -1,0 +1,591 @@
+import puppeteer from "puppeteer";
+
+const timeout_option = {
+    timeout: 90000,
+};
+
+function createPropertyObject() {
+    return {
+        processed_date: new Date().toISOString().split('T')[0],
+        order_number: "",
+        borrower_name: "",
+        owner_name: [],
+        property_address: "",
+        parcel_number: "",
+        land_value: "",
+        improvements: "",
+        total_assessed_value: "",
+        exemption: "",
+        total_taxable_value: "",
+        taxing_authority: "Wyandot County Treasurer, 109 S Sandusky Avenue, Room 22, Upper Sandusky, OH 43351",
+        notes: "",
+        delinquent: "NONE",
+        tax_history: [],
+    };
+}
+
+function createTaxHistory() {
+    return {
+        jurisdiction: "County",
+        year: "",
+        payment_type: "Semi-Annual",
+        status: "",
+        base_amount: "",
+        amount_paid: "",
+        amount_due: "",
+        mailing_date: "N/A",
+        due_date: "",
+        delq_date: "",
+        paid_date: "",
+        good_through_date: "-",
+    };
+}
+
+const generate_notes = (year, keys, status1, status2) => {
+    let notes = "";
+    try {
+        notes =
+            keys === 1
+                ? `ALL PRIORS ARE PAID,`
+                : `PRIORS ARE DELINQUENT,`;
+        notes += ` ${year} 1ST INSTALLMENT IS ${(status1 || "PAID").toUpperCase()}, 2ND INSTALLMENT IS ${(status2 || "PAID").toUpperCase()},`;
+        notes += ` NORMALLY TAXES ARE PAID SEMI-ANNUALLY,`;
+        notes += ` NORMAL DUE DATES ARE 02/20 AND 07/17`;
+    } catch (error) {
+        console.log(error);
+    } finally {
+        return notes;
+    }
+};
+
+const formatCurrency = (val) => {
+    if (val === null || val === undefined || val === '') return '$0.00';
+    const num = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+    if (isNaN(num)) return '$0.00';
+    return `$${num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+
+const parseCurrency = (str) => {
+    if (!str) return 0;
+    return parseFloat(String(str).replace(/[^0-9.-]/g, '')) || 0;
+};
+
+const formatDate = (dateStr) => {
+    if (!dateStr || dateStr === "N/A" || dateStr === "-") return "";
+    const clean = dateStr.trim();
+    const parts = clean.split('/');
+    if (parts.length === 3) {
+        const mm = parts[0].padStart(2, '0');
+        const dd = parts[1].padStart(2, '0');
+        let yyyy = parts[2];
+        if (yyyy.length === 2) yyyy = `20${yyyy}`;
+        return `${mm}/${dd}/${yyyy}`;
+    }
+    const d = new Date(dateStr);
+    if (!isNaN(d.getTime())) {
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${mm}/${dd}/${d.getFullYear()}`;
+    }
+    return dateStr;
+};
+
+function setRecordStatus(record) {
+    if (record.amount_due === "$0.00") {
+        record.status = "Paid";
+    } else {
+        const today = new Date();
+        const dueDateObj = new Date(record.due_date);
+        if (today <= dueDateObj) {
+            record.status = "Due";
+        } else {
+            record.status = "Delinquent";
+        }
+    }
+}
+
+async function launchBrowser() {
+    const browser = await puppeteer.launch({
+        headless: false,
+        args: [
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--lang="en-US"',
+            "--disable-features=HttpsFirstBalancedModeAutoEnable"
+        ],
+    });
+
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(60_000);
+    page.setDefaultTimeout(30_000);
+    return { browser, page };
+}
+
+async function searchAccountNumber(accountNumber, page) {
+    const cleanAccount = accountNumber.replace(/[-.]/g, '');
+    const url = `http://realestate.co.wyandot.oh.us/re/re-chg.php?account=${cleanAccount}&rec=&detail=Y`;
+    try {
+        await page.goto(url, { waitUntil: "networkidle2", ...timeout_option });
+    } catch (err) {
+        console.log("Navigation note:", err?.message || err);
+    }
+}
+
+async function getDetails(page, accountNumber) {
+    await page.waitForSelector('#headtable', timeout_option);
+    const cleanAccount = accountNumber.replace(/[-.]/g, '');
+
+    // 1. Scrape core property and current charge data from re-chg.php
+    const chgData = await page.evaluate(() => {
+        const clean = (text) => text ? text.replace(/[\s\xa0]+/g, ' ').trim() : '';
+
+        // Header info: Parcel number and Owner Name
+        const headtable = document.querySelector('#headtable');
+        let parcelNo = '';
+        let ownerName = '';
+        if (headtable) {
+            const ths = Array.from(headtable.querySelectorAll('th'));
+            const pTh = ths.find(th => /Parcel\s*No/i.test(th.textContent));
+            if (pTh && pTh.nextElementSibling) {
+                parcelNo = clean(pTh.nextElementSibling.textContent);
+            }
+            const oTh = ths.find(th => /Owner/i.test(th.textContent));
+            if (oTh && oTh.nextElementSibling) {
+                ownerName = clean(oTh.nextElementSibling.textContent);
+            }
+        }
+
+        // Main table: Address, 100% Values, Total Due (does NOT reflect amount prepaid), Summary Due
+        const maintable = document.querySelector('#maintable');
+        let address = '';
+        let totalVal = '';
+        let totalDueNotPrepaid = '';
+        let firstDue = '$.00';
+        let secondDue = '$.00';
+        let totalDue = '$.00';
+
+        if (maintable) {
+            const rows = Array.from(maintable.querySelectorAll('tr'));
+            const addrParts = [];
+            for (let i = 1; i < Math.min(5, rows.length); i++) {
+                const firstCell = rows[i]?.children?.[0]?.textContent || '';
+                const text = clean(firstCell);
+                if (text && !/JTS|TRUSTEE|ETAL|LLC/i.test(text) && /\d+|P\s*O\s*BOX|[A-Z]{2}\s+\d{5}/i.test(text)) {
+                    addrParts.push(text);
+                }
+            }
+            address = addrParts.join(', ');
+
+            // 100% Values
+            const allThs = Array.from(maintable.querySelectorAll('th'));
+        
+            const totalTh = allThs.find(th => th.textContent.trim() === 'Total');
+            if (totalTh && totalTh.nextElementSibling) totalVal = clean(totalTh.nextElementSibling.textContent);
+
+            // Total Due (does NOT reflect amount prepaid)
+            const notPrepaidTh = allThs.find(th => /Total Due \(does/i.test(th.textContent));
+            if (notPrepaidTh && notPrepaidTh.nextElementSibling) {
+                totalDueNotPrepaid = clean(notPrepaidTh.nextElementSibling.textContent);
+            }
+
+            // Due summary row
+            const propClassTh = allThs.find(th => th.textContent.trim() === 'Property Class');
+            const summaryRow = propClassTh?.parentElement?.nextElementSibling;
+            if (summaryRow) {
+                const cells = summaryRow.querySelectorAll('td');
+                if (cells.length >= 5) {
+                    firstDue = clean(cells[2].textContent);
+                    secondDue = clean(cells[3].textContent);
+                    totalDue = clean(cells[4].textContent);
+                }
+            }
+        }
+
+        // Charge table (#maintable2)
+        const detailTables = Array.from(document.querySelectorAll('table#maintable2'));
+        const chargeTable = detailTables.find(t => t.textContent.includes('Real Estate') && t.textContent.includes('1st Half'));
+        let charges = {
+            priorDue: '0.00',
+            firstCharge: '0.00',
+            firstCredit: '0.00',
+            firstDue: '0.00',
+            secondCharge: '0.00',
+            secondCredit: '0.00',
+            secondRemitter: '0.00',
+            secondDue: '0.00',
+        };
+
+        if (chargeTable) {
+            const trs = Array.from(chargeTable.querySelectorAll('tr'));
+            trs.forEach(tr => {
+                const th = tr.querySelector('th');
+                const rowType = clean(th?.textContent);
+                const tds = Array.from(tr.querySelectorAll('td')).map(td => clean(td.textContent));
+                // Indices: 0: Prior, 1: Dec Int, 2: 1st Half, 3: 1st Pen, 4: 2nd Half, 5: 2nd Pen, 6: Aug Int
+                if (rowType === 'Charge') {
+                    charges.firstCharge = tds[2] || '0.00';
+                    charges.secondCharge = tds[4] || '0.00';
+                } else if (rowType === 'Credit') {
+                    charges.firstCredit = tds[2] || '0.00';
+                    charges.secondCredit = tds[4] || '0.00';
+                } else if (rowType === 'Remitter') {
+                    charges.secondRemitter = tds[4] || '0.00';
+                } else if (rowType === 'Due') {
+                    const pDue = parseFloat(tds[0] || '0') + parseFloat(tds[1] || '0');
+                    charges.priorDue = pDue.toFixed(2);
+                    const fDue = parseFloat(tds[2] || '0') + parseFloat(tds[3] || '0');
+                    charges.firstDue = fDue.toFixed(2);
+                    const sDue = parseFloat(tds[4] || '0') + parseFloat(tds[5] || '0') + parseFloat(tds[6] || '0');
+                    charges.secondDue = sDue.toFixed(2);
+                }
+            });
+        }
+
+        // Payments
+        const paymentTable = detailTables.find(t => t.textContent.includes('Payment Information'));
+        const payments = [];
+        if (paymentTable) {
+            const rows = Array.from(paymentTable.querySelectorAll('tr')).slice(2);
+            for (const row of rows) {
+                const cells = row.querySelectorAll('td');
+                if (cells.length >= 2) {
+                    const dt = clean(cells[0].textContent);
+                    const amt = clean(cells[1].textContent);
+                    if (dt && amt) {
+                        payments.push({ date: dt, amount: amt });
+                    }
+                }
+            }
+        }
+
+        return {
+            parcelNo,
+            ownerName,
+            address,
+            totalVal,
+            totalDueNotPrepaid,
+            firstDue,
+            secondDue,
+            totalDue,
+            charges,
+            payments
+        };
+    });
+
+    // Calculate actual due for 1st Half and 2nd Half:
+    // Charge minus Credit is the remaining due.
+    // Also consider penalties/interest in Due row / summary row / totalDueNotPrepaid.
+    const fCharge = parseCurrency(chgData.charges.firstCharge);
+    const fCredit = parseCurrency(chgData.charges.firstCredit);
+    const fDueTable = Math.max(parseCurrency(chgData.firstDue), parseCurrency(chgData.charges.firstDue));
+    const fDueCalc = Math.max(0, fCharge - fCredit);
+    const firstDueFinal = fDueTable > 0 ? fDueTable : fDueCalc;
+
+    const sCharge = parseCurrency(chgData.charges.secondCharge);
+    const sCredit = parseCurrency(chgData.charges.secondCredit);
+    const sDueTable = Math.max(parseCurrency(chgData.secondDue), parseCurrency(chgData.charges.secondDue));
+    const sDueCalc = Math.max(0, sCharge - sCredit);
+    let secondDueFinal = sDueTable > 0 ? sDueTable : sDueCalc;
+    if (chgData.totalDueNotPrepaid && parseCurrency(chgData.totalDueNotPrepaid) > 0) {
+        secondDueFinal = Math.max(secondDueFinal, parseCurrency(chgData.totalDueNotPrepaid));
+    }
+
+    const isFirstHalfPaid = firstDueFinal === 0;
+    const isSecondHalfPaid = secondDueFinal === 0;
+    const isPriorPaid = parseCurrency(chgData.charges.priorDue) === 0;
+    const isCurrentYearPaid = isFirstHalfPaid && isSecondHalfPaid && isPriorPaid;
+
+    let priorYearsUnpaid = [];
+
+    // If current year is NOT paid, check previous years until first paid year arrives
+    if (!isCurrentYearPaid) {
+        // Fetch re-hstp.php for payments
+        const hstpUrl = `http://realestate.co.wyandot.oh.us/re/re-hstp.php?account=${cleanAccount}&rec=`;
+        await page.goto(hstpUrl, { waitUntil: "networkidle2", ...timeout_option });
+        const hstpPayments = await page.evaluate(() => {
+            const clean = (text) => text ? text.replace(/[\s\xa0]+/g, ' ').trim() : '';
+            const paymentsByYear = {};
+            const trs = Array.from(document.querySelectorAll('table#maintable tr'));
+            let currentYr = null;
+
+            trs.forEach(tr => {
+                if (tr.id === 'ownerbio' && tr.textContent.includes('Tax Year')) {
+                    const yrCell = tr.querySelector('td');
+                    currentYr = clean(yrCell?.textContent);
+                    if (currentYr) paymentsByYear[currentYr] = [];
+                } else if (currentYr) {
+                    const tds = Array.from(tr.querySelectorAll('td'));
+                    if (tds.length >= 4) {
+                        const date = clean(tds[2]?.textContent);
+                        const amt = clean(tds[3]?.textContent);
+                        if (date && amt && !/remitter/i.test(amt)) {
+                            paymentsByYear[currentYr].push({ date, amt });
+                        }
+                    }
+                }
+            });
+            return paymentsByYear;
+        });
+
+        // Fetch re-hst.php for past years net taxes
+        const hstUrl = `http://realestate.co.wyandot.oh.us/re/re-hst.php?account=${cleanAccount}&rec=`;
+        await page.goto(hstUrl, { waitUntil: "networkidle2", ...timeout_option });
+        const hstRecords = await page.evaluate(() => {
+            const clean = (text) => text ? text.replace(/[\s\xa0]+/g, ' ').trim() : '';
+            const tables = Array.from(document.querySelectorAll('table#maintable'));
+            const results = [];
+            // Skip table 0 (header) and table 1 (Payment History link)
+            for (let i = 2; i < tables.length; i++) {
+                const tbl = tables[i];
+                const trs = Array.from(tbl.querySelectorAll('tr'));
+                if (trs.length < 2) continue;
+
+                // First data row has Tax Year and Net tax at the end
+                const row1Cells = Array.from(trs[1].querySelectorAll('td'));
+                if (row1Cells.length === 0) continue;
+                const year = clean(row1Cells[0].textContent);
+                if (!/^\d{4}$/.test(year)) continue;
+
+                const netTax = clean(row1Cells[row1Cells.length - 1].textContent);
+                results.push({ year, netTax });
+            }
+            return results;
+        });
+
+        // Iterate backwards through previous years
+        for (const rec of hstRecords) {
+            const yrNum = parseInt(rec.year, 10);
+            if (yrNum >= 2025) continue; // Skip current year
+
+            const payments = hstpPayments[rec.year] || [];
+            const totalPaid = payments.reduce((sum, p) => sum + (parseFloat(p.amt.replace(/[^0-9.-]/g, '')) || 0), 0);
+            const netVal = parseFloat(rec.netTax.replace(/[^0-9.-]/g, '')) || 0;
+
+            const isYearPaid = totalPaid > 0 && totalPaid >= (netVal - 0.5);
+
+            if (!isYearPaid) {
+                priorYearsUnpaid.push({
+                    year: rec.year,
+                    netTax: rec.netTax,
+                    payments
+                });
+            } else {
+                // First paid year arrived, stop checking!
+                break;
+            }
+        }
+    }
+
+    return {
+        chgData,
+        firstDueFinal,
+        secondDueFinal,
+        isCurrentYearPaid,
+        priorYearsUnpaid,
+        accountNumber
+    };
+}
+
+function populateObject(data) {
+    const { chgData, firstDueFinal, secondDueFinal, isCurrentYearPaid, priorYearsUnpaid, accountNumber } = data;
+    const property = createPropertyObject();
+
+    property.parcel_number = chgData.parcelNo || accountNumber;
+    property.owner_name = chgData.ownerName ? [chgData.ownerName] : [];
+    property.property_address = chgData.address || "";
+    property.land_value = formatCurrency(chgData.landVal);
+    property.improvements = formatCurrency(chgData.bldgVal);
+    property.total_assessed_value = formatCurrency(chgData.totalVal);
+    property.total_taxable_value = property.total_assessed_value;
+
+    const currentTaxYear = "2025";
+    const currentCollYear = "2026";
+
+    // --- Installment 1 (1st Half) ---
+    const inst1 = createTaxHistory();
+    inst1.year = currentTaxYear;
+    inst1.payment_type = "Installment 1";
+    inst1.due_date = `02/20/${currentCollYear}`;
+    inst1.delq_date = `02/21/${currentCollYear}`;
+    inst1.base_amount = formatCurrency(chgData.charges.firstCharge);
+
+    // --- Installment 2 (2nd Half) ---
+    const inst2 = createTaxHistory();
+    inst2.year = currentTaxYear;
+    inst2.payment_type = "Installment 2";
+    inst2.due_date = `07/17/${currentCollYear}`;
+    inst2.delq_date = `07/18/${currentCollYear}`;
+    inst2.base_amount = formatCurrency(chgData.charges.secondCharge);
+
+    // Match payment dates from valid payments (excluding "remitter")
+    const validPayments = chgData.payments.filter(p => !/remitter/i.test(p.amount));
+    let paidDate1 = "";
+    let paidDate2 = "";
+    if (validPayments.length === 1) {
+        paidDate1 = formatDate(validPayments[0].date);
+        paidDate2 = formatDate(validPayments[0].date);
+    } else if (validPayments.length >= 2) {
+        paidDate1 = formatDate(validPayments[0].date);
+        paidDate2 = formatDate(validPayments[1].date);
+    }
+
+    // 1st Half amounts
+    inst1.amount_due = formatCurrency(firstDueFinal);
+    const fCredit = parseCurrency(chgData.charges.firstCredit);
+    inst1.amount_paid = fCredit > 0 ? formatCurrency(fCredit) : (firstDueFinal === 0 ? inst1.base_amount : "$0.00");
+    inst1.paid_date = parseCurrency(inst1.amount_paid) > 0 ? paidDate1 : "";
+    if (inst1.amount_due === "$0.00") {
+        inst1.status = "Paid";
+    } else {
+        const today = new Date();
+        const dueDateObj = new Date(inst1.due_date);
+        if (today <= dueDateObj) {
+            inst1.status = "Due";
+        } else {
+            inst1.status = "Delinquent";
+        }
+    }
+
+    // 2nd Half amounts:
+    // If credit is 474.09 against charge 514.57, due is 40.48, paid is 474.09
+    inst2.amount_due = formatCurrency(secondDueFinal);
+    const sCredit = parseCurrency(chgData.charges.secondCredit);
+    inst2.amount_paid = sCredit > 0 ? formatCurrency(sCredit) : (secondDueFinal === 0 ? inst2.base_amount : "$0.00");
+    inst2.paid_date = parseCurrency(inst2.amount_paid) > 0 ? paidDate2 : "";
+    if (inst2.amount_due === "$0.00") {
+        inst2.status = "Paid";
+    } else {
+        const today = new Date();
+        const dueDateObj = new Date(inst2.due_date);
+        if (today <= dueDateObj) {
+            inst2.status = "Due";
+        } else {
+            inst2.status = "Delinquent";
+        }
+    }
+
+    property.tax_history.push(inst1, inst2);
+
+    // Add unpaid previous years until the first paid year if current year is not paid
+    if (!isCurrentYearPaid && priorYearsUnpaid && priorYearsUnpaid.length > 0) {
+        for (const pyr of priorYearsUnpaid) {
+            const yr = pyr.year;
+            const collYr = parseInt(yr, 10) + 1;
+            const halfNet = (parseCurrency(pyr.netTax) / 2).toFixed(2);
+
+            const pInst1 = createTaxHistory();
+            pInst1.year = yr;
+            pInst1.payment_type = "Installment 1";
+            pInst1.due_date = `02/20/${collYr}`;
+            pInst1.delq_date = `02/21/${collYr}`;
+            pInst1.base_amount = formatCurrency(halfNet);
+            pInst1.amount_paid = "$0.00";
+            pInst1.amount_due = formatCurrency(halfNet);
+            if (pInst1.amount_due === "$0.00") {
+                pInst1.status = "Paid";
+            } else {
+                const today = new Date();
+                const dueDateObj = new Date(pInst1.due_date);
+                if (today <= dueDateObj) {
+                    pInst1.status = "Due";
+                } else {
+                    pInst1.status = "Delinquent";
+                }
+            }
+            pInst1.paid_date = "";
+
+            const pInst2 = createTaxHistory();
+            pInst2.year = yr;
+            pInst2.payment_type = "Installment 2";
+            pInst2.due_date = `07/17/${collYr}`;
+            pInst2.delq_date = `07/18/${collYr}`;
+            pInst2.base_amount = formatCurrency(halfNet);
+            pInst2.amount_paid = "$0.00";
+            pInst2.amount_due = formatCurrency(halfNet);
+            if (pInst2.amount_due === "$0.00") {
+                pInst2.status = "Paid";
+            } else {
+                const today = new Date();
+                const dueDateObj = new Date(pInst2.due_date);
+                if (today <= dueDateObj) {
+                    pInst2.status = "Due";
+                } else {
+                    pInst2.status = "Delinquent";
+                }
+            }
+            pInst2.paid_date = "";
+
+            property.tax_history.push(pInst1, pInst2);
+        }
+    }
+
+    const result = property;
+
+    result.tax_history.sort((a, b) => {
+        const yearA = parseInt(a.year, 10) || 0;
+        const yearB = parseInt(b.year, 10) || 0;
+        if (yearA !== yearB) {
+            return yearA - yearB;
+        }
+        const aPaid = a.status === "PAID" || (a.status || "").toUpperCase() === "PAID";
+        const bPaid = b.status === "PAID" || (b.status || "").toUpperCase() === "PAID";
+        if (aPaid && !bPaid) return -1;
+        if (!aPaid && bPaid) return 1;
+        return 0;
+    });
+
+    if (result.tax_history.length > 0) {
+        // Check if ANY tax is delinquent for the main delinquency flag
+        const hasDelinquent = result.tax_history.some(
+            (t) => t.status === "DELINQUENT" || (t.status || "").toUpperCase() === "DELINQUENT",
+        );
+        result.delinquent = hasDelinquent
+            ? "TAXES ARE DELINQUENT, NEED TO CALL FOR PAYOFF"
+            : "NONE";
+
+        // Get the latest tax record (the array is sorted ascending by year)
+        const latestTax = result.tax_history[result.tax_history.length - 1];
+
+        // Find individual statuses for the 1st and 2nd installments of the latest year
+        const latestYearRecords = result.tax_history.filter(t => String(t.year) === String(latestTax.year));
+        const inst1 = latestYearRecords.find(t => t.payment_type === "INSTALLMENT 1" || (t.payment_type || "").toUpperCase() === "INSTALLMENT 1");
+        const inst2 = latestYearRecords.find(t => t.payment_type === "INSTALLMENT 2" || (t.payment_type || "").toUpperCase() === "INSTALLMENT 2");
+
+        const status1 = inst1 ? inst1.status : "UNKNOWN";
+        const status2 = inst2 ? inst2.status : "UNKNOWN";
+
+        // Check if any PRIOR year is delinquent (exclude the latest year)
+        const hasPriorDelinquent = result.tax_history.some(
+            (t) => (t.status === "DELINQUENT" || (t.status || "").toUpperCase() === "DELINQUENT") && String(t.year) !== String(latestTax.year)
+        );
+
+        // If priors are delinquent, keys = 0. If priors are paid, keys = 1.
+        const keys = hasPriorDelinquent ? 0 : 1;
+        result.notes = generate_notes(latestTax.year, keys, status1, status2);
+    }
+    return result;
+}
+
+async function run(accountNumber) {
+    let browser;
+    try {
+        const launched = await launchBrowser();
+        browser = launched.browser;
+        const page = launched.page;
+
+        await searchAccountNumber(accountNumber, page);
+        const data = await getDetails(page, accountNumber);
+        const result = populateObject(data);
+
+        console.log("\n================ POPULATED PROPERTY OBJECT ================");
+        console.log(JSON.stringify(result, null, 2));
+        return result;
+    } catch (err) {
+        console.log("Error during running sequence execution pipeline: ", err);
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
+run("10-612500.0000");
