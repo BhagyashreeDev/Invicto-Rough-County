@@ -17,7 +17,7 @@ function createPropertyObject() {
         total_assessed_value: "",
         exemption: "",
         total_taxable_value: "",
-        taxing_authority: "Delaware County Treasurer, 145 N Union St, Delaware, OH 43015",
+        taxing_authority: "Columbiana",
         notes: "",
         delinquent: "NONE",
         tax_history: [],
@@ -79,9 +79,9 @@ function populateObject(accountNumber, propData, taxData) {
     if (propData.ownerName) {
         result.owner_name = propData.ownerName.split("&").map(name => name.trim());
     }
-    result.property_address = propData.propertyAddress || "";
-    result.total_assessed_value = taxData.totalAssessedValue || "";
-    result.total_taxable_value = result.total_assessed_value;
+    result.property_address = propData.propertyAddress || "N/A";
+    result.total_assessed_value = taxData.totalAssessedValue || "N/A";
+    result.total_taxable_value = taxData.totalTaxableValue || "N/A";
 
     if (taxData.taxYear !== "Unknown") {
         const dueYear = parseInt(taxData.taxYear, 10) + 1;
@@ -202,7 +202,7 @@ async function getDetails(page, accountNumber) {
 
     // 3. Navigate to the Tax page
     await page.goto(
-        `https://delaware-auditor-ohio.manatron.com/Tax.aspx?mpropertynumber=${accountNumber}`,
+        `https://oh-columbiana-auditor.publicaccessnow.com/Tax.aspx?mpropertynumber=${accountNumber}`,
         { waitUntil: "networkidle2", ...timeout_option }
     );
 
@@ -226,7 +226,21 @@ async function getDetails(page, accountNumber) {
 
         const landValue = getValueByTdLabel("Land");
         const improvementsValue = getValueByTdLabel("Improvements");
-        const totalAssessedValue = getValueByTdLabel("Total");
+
+        const totalTds = tds.filter(td => td.textContent.trim() === "Total" && td.nextElementSibling && td.nextElementSibling.textContent.includes("$"));
+        
+        let totalAssessedValue = null;
+        let totalTaxableValue = null;
+
+        if (totalTds.length >= 2) {
+            // If 2 or more totals exist: Assessed is typically first, Taxable is second
+            totalAssessedValue = clean(totalTds[0].nextElementSibling.textContent);
+            totalTaxableValue = clean(totalTds[1].nextElementSibling.textContent);
+        } else if (totalTds.length === 1) {
+            // If only 1 total is found (varies by county): assign it to both
+            totalAssessedValue = clean(totalTds[0].nextElementSibling.textContent);
+            totalTaxableValue = clean(totalTds[0].nextElementSibling.textContent);
+        }
 
         const getTaxRowValues = (rowLabel) => {
             const labelTd = tds.find(td => td.textContent.trim() === rowLabel);
@@ -286,6 +300,7 @@ async function getDetails(page, accountNumber) {
             landValue,
             improvementsValue,
             totalAssessedValue,
+            totalTaxableValue,
             taxYear: taxYear || "Unknown",
             firstHalf: {
                 netTaxDue: netTaxDue.firstHalf,
@@ -315,7 +330,7 @@ async function run(accountNumber) {
         ({ browser, page } = await launchBrowser());
 
         await page.goto(
-            `https://delaware-auditor-ohio.manatron.com/Property.aspx?mpropertynumber=${accountNumber}`,
+            `https://oh-columbiana-auditor.publicaccessnow.com/Property.aspx?mpropertynumber=${accountNumber}`,
             { waitUntil: "networkidle2", ...timeout_option }
         );
 
@@ -329,4 +344,4 @@ async function run(accountNumber) {
 }
 
 // Execute
-run("618-131-21-008-000");
+run("18-01088.000");
