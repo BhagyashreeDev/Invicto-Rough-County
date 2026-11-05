@@ -147,7 +147,7 @@ async function run(accountNumber) {
         const { browser, page } = await launchBrowser();
 
         await page.goto(
-            `https://dixie.floridatax.us/PropertyDetail?p=${accountNumber}`,
+            `https://taxes.clevelandcountytreasurer.org/PropertyDetailOk?p=${accountNumber}`,
             { waitUntil: "networkidle2", ...timeout_option }
         );
 
@@ -157,4 +157,4 @@ async function run(accountNumber) {
     }
 }
 
-run("360913-45100000-0120");
+run("14955");
